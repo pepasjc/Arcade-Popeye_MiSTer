@@ -379,7 +379,12 @@ port(
  
  dl_addr        : in  std_logic_vector(16 downto 0);
  dl_wr          : in  std_logic;
- dl_data        : in  std_logic_vector( 7 downto 0)
+ dl_data        : in  std_logic_vector( 7 downto 0);
+
+ -- RetroAchievements tap: Z80 memory write cycles (clock_40 domain)
+ ra_cpu_wr      : out std_logic;
+ ra_cpu_addr    : out std_logic_vector(15 downto 0);
+ ra_cpu_do      : out std_logic_vector( 7 downto 0)
 
  );
 end popeye;
@@ -744,6 +749,11 @@ cpu_di <= cpu_rom_do_swp	 when cpu_mreq_n  = '0' and cpu_addr(15 downto 12) < X"
 ------------------------------------------
 -- write enable / ram access from CPU --
 ------------------------------------------
+-- RetroAchievements tap (mapped to FinalBurn Neo offsets in Arcade-Popeye.sv)
+ra_cpu_wr   <= '1' when cpu_mreq_n = '0' and cpu_wr_n = '0' and cpu_rfsh_n = '1' else '0';
+ra_cpu_addr <= cpu_addr;
+ra_cpu_do   <= cpu_do;
+
 wram_addr <= (skyskipr and cpu_addr(11)) & cpu_addr(10 downto 0) when hcnt(0) = '0' else skyskipr & '1' & sp_ram_addr(9 downto 0);
 
 wram_we         <= '1' when cpu_mreq_n = '0' and cpu_wr_n = '0' and (cpu_addr and x"F000") = x"8000" and hcnt(0) = '0' and skyskipr = '1' else 

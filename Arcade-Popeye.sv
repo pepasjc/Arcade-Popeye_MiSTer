@@ -191,7 +191,7 @@ assign VIDEO_ARY =  (!ar) ? ( 12'd365) : 12'd0;
 
 `include "build_id.v" 
 localparam CONF_STR = {
-	"A.POPEYE;;",
+	"RA_POPEYE;;",
 	"H0OEF,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	//"O35,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"O3,Scandoubler,Off,On;",
@@ -317,6 +317,11 @@ wire  [7:0] ioctl_dout;
 
 wire reset = status[0] | buttons[1] | rom_download;
 
+// RetroAchievements tap (see RETROACHIEVEMENTS below)
+wire        ra_cpu_wr;
+wire [15:0] ra_cpu_addr;
+wire  [7:0] ra_cpu_do;
+
 popeye popeye
 (
 	.clock_40(clk_sys),
@@ -365,7 +370,11 @@ popeye popeye
 	              // PONMLKJI
 	.sw2(sw[1]),  // 11000010 -- Cocktail(1b) / Service(1b) / Bonus(1b) / n.u.(3b) / life(2b)
  
-	.service(sw[2][0])
+	.service(sw[2][0]),
+
+	.ra_cpu_wr(ra_cpu_wr),
+	.ra_cpu_addr(ra_cpu_addr),
+	.ra_cpu_do(ra_cpu_do)
 );
 
 wire ce_pix_old;
@@ -393,5 +402,88 @@ arcade_video #(512,8) arcade_video
 assign AUDIO_L = { audio_l };
 assign AUDIO_R = { audio_r };
 assign AUDIO_S = 0;
+
+///////////////////   RETROACHIEVEMENTS   //////////////////
+//
+// RAM mirror for the RetroAchievements fork of Main_MiSTer (popeye_ra_mirror.v,
+// from jotego's jtframe via the RA jtcores fork). RA arcade sets are written
+// against FinalBurn Neo, whose Popeye driver (d_popeye.cpp) exposes the
+// MemIndex concatenation as "All Ram":
+//     0x0000 DrvZ80RAM      0x0C00  Z80 8000-8BFF
+//     0x0C00 DrvZ80RAM2     0x0200  Z80 8E80-8FFF (0x0C00-0x0D7F)
+//     0x0E00 DrvVidRAM      0x0400  Z80 A000-A3FF
+//     0x1200 DrvColorRAM    0x0400  Z80 A400-A7FF
+//     0x1600 DrvSpriteRAM   0x0300  Z80 8C04-8E7F (0x1600-0x187B)
+//     0x1900 DrvBGRAM       0x2000  Z80 C000-DFFF (Sky Skipper: FBNeo's
+//                                   scrambled offset, bit 7 of the data -> 0x40)
+//     0x3900 background_pos 3       Z80 8C00-8C02
+//     0x3903 palette_bank   2       Z80 8C03
+//     0x3905 bgbitmap       2 MB    rendered background bitmap, not mirrored
+// Writes are mapped by the CPU address, as FBNeo does, although on the board
+// 8000-87FF, 8800-8FFF (and the rest of 8000-9FFF) are one 2 kB RAM: the
+// program only ever uses FBNeo's view. The Z80 is 8-bit: shadow byte k is RA
+// address k; the ARM region table is the identity {0, 0x3905, 0}.
+//
+// Nothing else uses DDR in this core, so the mirror owns the port and copies
+// (2k qwords, ~0.1 ms) at the start of every VBlank. Held off during ROM
+// download.
+
+reg        ra_we;
+reg [13:0] ra_off;
+reg  [7:0] ra_d;
+always @(posedge clk_sys) begin
+	reg [15:0] a;
+	a = ra_cpu_addr;
+	ra_d  <= ra_cpu_do;
+	ra_we <= ra_cpu_wr;
+	casez (a)
+		16'b1000_0???_????_????,
+		16'b1000_10??_????_????:                ra_off <= a[13:0] - 14'h0000;          // 8000-8BFF
+		16'b1000_1100_0000_00??:                ra_off <= 14'h3900 + a[1:0];           // 8C00-8C03
+		16'b1101_????_????_????,
+		16'b1100_????_????_????:                ra_off <= |mod ? 14'h1900 + {a[11:6], ra_cpu_do[7], a[5:0]}
+		                                                      : 14'h1900 + a[12:0];    // C000-DFFF
+		16'b1010_00??_????_????:                ra_off <= 14'h0E00 + a[9:0];           // A000-A3FF
+		16'b1010_01??_????_????:                ra_off <= 14'h1200 + a[9:0];           // A400-A7FF
+		default: begin
+			ra_off <= 14'h1600 + (a[13:0] - 14'h0C04);                                 // 8C04-8E7F
+			if (a >= 16'h8E80 && a <= 16'h8FFF) ra_off <= 14'h0C00 + (a[13:0] - 14'h0E80);
+			if (a <  16'h8C04 || a >  16'h8FFF) ra_we  <= 0;
+		end
+	endcase
+end
+
+wire  [7:0] ra_burstcnt, ra_be;
+wire [28:0] ra_addr;
+wire [63:0] ra_din;
+wire        ra_ddr_we, ra_active;
+
+popeye_ra_mirror #(.AW(14)) ra_mirror
+(
+	.rst(reset),
+	.clk(clk_sys),
+	.lvbl(~vblank),
+	.hold(ioctl_download),
+	.start_ok(1'b1),
+	.wr_clk(clk_sys),
+	.wr_word({ 2'd0, ra_off[13:1] }),
+	.wr_din({ 2{ra_d} }),
+	.wr_be(~ra_we ? 2'b00 : ra_off[0] ? 2'b10 : 2'b01),
+	.active(ra_active),
+	.ddr_busy(DDRAM_BUSY),
+	.ddr_burstcnt(ra_burstcnt),
+	.ddr_addr(ra_addr),
+	.ddr_we(ra_ddr_we),
+	.ddr_be(ra_be),
+	.ddr_din(ra_din)
+);
+
+assign DDRAM_CLK      = clk_sys;
+assign DDRAM_BURSTCNT = ra_burstcnt;
+assign DDRAM_ADDR     = ra_addr;
+assign DDRAM_DIN      = ra_din;
+assign DDRAM_BE       = ra_be;
+assign DDRAM_WE       = ra_ddr_we;
+assign DDRAM_RD       = 1'b0;
 
 endmodule
